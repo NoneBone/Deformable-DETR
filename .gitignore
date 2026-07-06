@@ -3,5 +3,8 @@ build/
 *.egg-info
 *.pyc
 *.nsys-rep
+*.ncu-rep
+
 data/coco
 .vscode/launch.json
+models/ops/dist/
