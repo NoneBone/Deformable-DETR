@@ -1,0 +1,7 @@
+build/
+
+*.egg-info
+*.pyc
+*.nsys-rep
+data/coco
+.vscode/launch.json
