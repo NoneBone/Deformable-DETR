@@ -19,7 +19,7 @@
 #include <ATen/cuda/CUDAContext.h>
 
 #include <THC/THCAtomics.cuh>
-#define OPT 2
+#define OPT 3
 #define CUDA_KERNEL_LOOP(i, n)                          \
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;   \
       i < (n);                                          \

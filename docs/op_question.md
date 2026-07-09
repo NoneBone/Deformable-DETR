@@ -159,6 +159,29 @@ All forward tests PASSED.
 [BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              22695.42 us   285.99 GB/s
 ```
 
+## opt3.naive+float4
+保持 opt0 的线程组织与循环结构，仅在 `float32 + channels % 4 == 0` 时改为
+“1 线程 = 1 float4”，用于隔离验证向量化本身的收益。
+
+```sh
+=== MSDeformAttn forward tests ===
+
+[PASS] FP64 B=1  Q=2    H=2  C=2  L=2 P=2 step=1  (sanity)                      [MAX] abs_err 8.674e-19 rel_err 1.978e-16
+[PASS] FP32 B=2  Q=32   H=4  C=8  L=3 P=4 step=2  (multi-level)                 [MAX] abs_err 4.657e-10 rel_err 1.130e-07
+[PASS] FP32 B=2  Q=128  H=8  C=16 L=4 P=4 step=2  (detector-like)               [MAX] abs_err 4.657e-10 rel_err 1.130e-07
+
+All forward tests PASSED.
+
+=== MSDeformAttn forward benchmarks (warmup=10, iters=100) ===
+[BENCH] FP32 B=1  Q=300  H=8  C=32 L=4 P=4 step=1  (deformable-detr)                  15.24 us   415.90 GB/s
+[BENCH] FP32 B=2  Q=300  H=8  C=32 L=4 P=4 step=2  (batched-2)                        31.36 us   404.31 GB/s
+[BENCH] FP32 B=4  Q=300  H=8  C=32 L=4 P=4 step=4  (batched-4)                        51.84 us   489.12 GB/s
+[BENCH] FP32 B=16 Q=300  H=8  C=32 L=4 P=4 step=16 (batched-16)                      313.81 us   323.18 GB/s
+[BENCH] FP32 B=64 Q=300  H=8  C=32 L=4 P=4 step=64 (batched-64)                     1265.29 us   320.61 GB/s
+[BENCH] FP32 B=256 Q=300  H=8  C=32 L=4 P=4 step=256 (batched-256)                  5002.58 us   324.37 GB/s
+[BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              19954.29 us   325.28 GB/s
+```
+
 ## opt4.v3+reg_prefetch
 在 opt3 的基础上，只做 one-step 寄存器级预取：
 当前 sample 计算时，提前把下一个 sample 的 `loc/weight/shape/level_start`
