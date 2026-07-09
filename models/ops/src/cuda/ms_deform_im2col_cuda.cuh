@@ -11,13 +11,15 @@
 
 #include <cstdio>
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
+#include <type_traits>
 
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 
 #include <THC/THCAtomics.cuh>
-
+#define OPT 3 // 优化方法控制
 #define CUDA_KERNEL_LOOP(i, n)                          \
   for (int i = blockIdx.x * blockDim.x + threadIdx.x;   \
       i < (n);                                          \
@@ -89,6 +91,93 @@ __device__ scalar_t ms_deform_attn_im2col_bilinear(const scalar_t* &bottom_data,
   const scalar_t w1 = hh * hw, w2 = hh * lw, w3 = lh * hw, w4 = lh * lw;
 
   const scalar_t val = (w1 * v1 + w2 * v2 + w3 * v3 + w4 * v4);
+  return val;
+}
+
+template <typename scalar_t>
+__device__ __forceinline__ scalar_t ldg_read(const scalar_t* ptr)
+{
+#if __CUDA_ARCH__ >= 350
+  return __ldg(ptr);
+#else
+  return *ptr;
+#endif
+}
+
+__device__ __forceinline__ float4 ldg_read_float4(const float* ptr)
+{
+#if __CUDA_ARCH__ >= 350
+  return __ldg(reinterpret_cast<const float4*>(ptr));
+#else
+  return *reinterpret_cast<const float4*>(ptr);
+#endif
+}
+
+__device__ __forceinline__ float4 load_float4(const float* ptr)
+{
+  return *reinterpret_cast<const float4*>(ptr);
+}
+
+__device__ __forceinline__ float4 ms_deform_attn_im2col_bilinear_float4(
+    const float* bottom_data,
+    const int height,
+    const int width,
+    const int nheads,
+    const int channels,
+    const float h,
+    const float w,
+    const int m,
+    const int c_base)
+{
+  const int h_low = floor(h);
+  const int w_low = floor(w);
+  const int h_high = h_low + 1;
+  const int w_high = w_low + 1;
+
+  const float lh = h - h_low;
+  const float lw = w - w_low;
+  const float hh = 1.f - lh;
+  const float hw = 1.f - lw;
+
+  const int w_stride = nheads * channels;
+  const int h_stride = width * w_stride;
+  const int h_low_ptr_offset = h_low * h_stride;
+  const int h_high_ptr_offset = h_low_ptr_offset + h_stride;
+  const int w_low_ptr_offset = w_low * w_stride;
+  const int w_high_ptr_offset = w_low_ptr_offset + w_stride;
+  const int base_ptr = m * channels + c_base;
+
+  float4 v1 = make_float4(0.f, 0.f, 0.f, 0.f);
+  if (h_low >= 0 && w_low >= 0)
+  {
+    v1 = load_float4(bottom_data + h_low_ptr_offset + w_low_ptr_offset + base_ptr);
+  }
+  float4 v2 = make_float4(0.f, 0.f, 0.f, 0.f);
+  if (h_low >= 0 && w_high <= width - 1)
+  {
+    v2 = load_float4(bottom_data + h_low_ptr_offset + w_high_ptr_offset + base_ptr);
+  }
+  float4 v3 = make_float4(0.f, 0.f, 0.f, 0.f);
+  if (h_high <= height - 1 && w_low >= 0)
+  {
+    v3 = load_float4(bottom_data + h_high_ptr_offset + w_low_ptr_offset + base_ptr);
+  }
+  float4 v4 = make_float4(0.f, 0.f, 0.f, 0.f);
+  if (h_high <= height - 1 && w_high <= width - 1)
+  {
+    v4 = load_float4(bottom_data + h_high_ptr_offset + w_high_ptr_offset + base_ptr);
+  }
+
+  const float w1 = hh * hw;
+  const float w2 = hh * lw;
+  const float w3 = lh * hw;
+  const float w4 = lh * lw;
+
+  float4 val;
+  val.x = w1 * v1.x + w2 * v2.x + w3 * v3.x + w4 * v4.x;
+  val.y = w1 * v1.y + w2 * v2.y + w3 * v3.y + w4 * v4.y;
+  val.z = w1 * v1.z + w2 * v2.z + w3 * v3.z + w4 * v4.z;
+  val.w = w1 * v1.w + w2 * v2.w + w3 * v3.w + w4 * v4.w;
   return val;
 }
 
@@ -242,7 +331,6 @@ __device__ void ms_deform_attn_col2im_bilinear_gm(const scalar_t* &bottom_data,
   atomicAdd(grad_sampling_loc + 1, height * grad_h_weight * top_grad_value);
 }
 
-#define OPT 1 // 
 #if OPT == 0
 template <typename scalar_t>
 __global__ void ms_deformable_im2col_gpu_kernel(const int n,
@@ -307,7 +395,7 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n,
     *data_col_ptr = col;
   }
 }
-#else if OPT == 1
+#elif OPT == 1
 template <typename scalar_t>
 __global__ void ms_deformable_im2col_gpu_kernel(
     const int n,
@@ -423,9 +511,320 @@ __global__ void ms_deformable_im2col_gpu_kernel(
       data_col_ptr[c_col] = col;
     }
 }
-#else if OPT == 2
-#else if OPT == 3
-#else if OPT == 4
+#elif OPT == 2 // float4
+template <typename scalar_t>
+__global__ void ms_deformable_im2col_gpu_kernel(
+    const int n,
+    const scalar_t* __restrict__ data_value,
+    const int64_t* __restrict__ data_spatial_shapes,
+    const int64_t* __restrict__ data_level_start_index,
+    const scalar_t* __restrict__ data_sampling_loc,
+    const scalar_t* __restrict__ data_attn_weight,
+    const int batch_size,
+    const int spatial_size,
+    const int num_heads,
+    const int channels,
+    const int num_levels,
+    const int num_query,
+    const int num_point,
+    scalar_t* __restrict__ data_col)
+{
+    extern __shared__ unsigned char smem_raw[];
+    const int sampling_index = blockIdx.x;
+    const int total_sampling = n / channels;
+    if (sampling_index >= total_sampling) return;
+
+    const int num_level_points = num_levels * num_point;
+    int* smem_ptr = reinterpret_cast<int*>(smem_raw);
+    scalar_t* smem_weight = reinterpret_cast<scalar_t*>(smem_ptr + num_level_points * 4);
+
+    const int m_col = sampling_index % num_heads;
+    const int b_col = (sampling_index / num_heads) / num_query;
+    const int qid_stride = num_heads * channels;
+    const int w_stride = qid_stride;
+    const int data_value_ptr_init_offset = b_col * spatial_size * qid_stride;
+    const scalar_t* data_value_ptr = data_value + data_value_ptr_init_offset;
+    const int sampling_offset = sampling_index * num_level_points;
+
+    for (int sample_offset = threadIdx.x; sample_offset < num_level_points; sample_offset += blockDim.x)
+    {
+      const int l_col = sample_offset / num_point;
+      const int spatial_h_ptr = l_col << 1;
+      const int spatial_h = static_cast<int>(ldg_read(data_spatial_shapes + spatial_h_ptr));
+      const int spatial_w = static_cast<int>(ldg_read(data_spatial_shapes + spatial_h_ptr + 1));
+      const int level_start_id = static_cast<int>(ldg_read(data_level_start_index + l_col));
+      const int data_weight_ptr = sampling_offset + sample_offset;
+      const int data_loc_w_ptr = data_weight_ptr << 1;
+      const scalar_t loc_w = ldg_read(data_sampling_loc + data_loc_w_ptr);
+      const scalar_t loc_h = ldg_read(data_sampling_loc + data_loc_w_ptr + 1);
+      const scalar_t attn_weight = ldg_read(data_attn_weight + data_weight_ptr);
+
+      int* ptr = smem_ptr + sample_offset * 4;
+      scalar_t* weight = smem_weight + sample_offset * 4;
+      ptr[0] = -1; ptr[1] = -1; ptr[2] = -1; ptr[3] = -1;
+      weight[0] = 0; weight[1] = 0; weight[2] = 0; weight[3] = 0;
+
+      const scalar_t h_im = loc_h * spatial_h - static_cast<scalar_t>(0.5);
+      const scalar_t w_im = loc_w * spatial_w - static_cast<scalar_t>(0.5);
+
+      if (h_im > -1 && w_im > -1 && h_im < spatial_h && w_im < spatial_w)
+      {
+        const int h_low = floor(h_im);
+        const int w_low = floor(w_im);
+        const int h_high = h_low + 1;
+        const int w_high = w_low + 1;
+
+        const scalar_t lh = h_im - h_low;
+        const scalar_t lw = w_im - w_low;
+        const scalar_t hh = 1 - lh;
+        const scalar_t hw = 1 - lw;
+
+        const int h_stride = spatial_w * w_stride;
+        const int base_ptr = level_start_id * qid_stride + m_col * channels;
+        const int h_low_ptr_offset = h_low * h_stride;
+        const int h_high_ptr_offset = h_low_ptr_offset + h_stride;
+        const int w_low_ptr_offset = w_low * w_stride;
+        const int w_high_ptr_offset = w_low_ptr_offset + w_stride;
+
+        if (h_low >= 0 && w_low >= 0)
+        {
+          ptr[0] = base_ptr + h_low_ptr_offset + w_low_ptr_offset;
+          weight[0] = attn_weight * hh * hw;
+        }
+        if (h_low >= 0 && w_high <= spatial_w - 1)
+        {
+          ptr[1] = base_ptr + h_low_ptr_offset + w_high_ptr_offset;
+          weight[1] = attn_weight * hh * lw;
+        }
+        if (h_high <= spatial_h - 1 && w_low >= 0)
+        {
+          ptr[2] = base_ptr + h_high_ptr_offset + w_low_ptr_offset;
+          weight[2] = attn_weight * lh * hw;
+        }
+        if (h_high <= spatial_h - 1 && w_high <= spatial_w - 1)
+        {
+          ptr[3] = base_ptr + h_high_ptr_offset + w_high_ptr_offset;
+          weight[3] = attn_weight * lh * lw;
+        }
+      }
+    }
+    __syncthreads();
+
+    scalar_t* data_col_ptr = data_col + sampling_index * channels;
+    if constexpr (std::is_same<scalar_t, float>::value)
+    {
+      const bool use_float4 =
+          ((channels & 3) == 0) &&
+          ((reinterpret_cast<uintptr_t>(data_value_ptr) & 0xF) == 0) &&
+          ((reinterpret_cast<uintptr_t>(data_col_ptr) & 0xF) == 0);
+      if (use_float4)
+      {
+        const int vec_channels = channels >> 2;
+        float* out_ptr = reinterpret_cast<float*>(data_col_ptr);
+        const float* in_ptr = reinterpret_cast<const float*>(data_value_ptr);
+        for (int c_vec = threadIdx.x; c_vec < vec_channels; c_vec += blockDim.x)
+        {
+          const int c_base = c_vec << 2;
+          float4 acc = make_float4(0.f, 0.f, 0.f, 0.f);
+          #pragma unroll
+          for (int sample_offset = 0; sample_offset < num_level_points; ++sample_offset)
+          {
+            const int* ptr = smem_ptr + sample_offset * 4;
+            const scalar_t* weight = smem_weight + sample_offset * 4;
+            if (ptr[0] >= 0)
+            {
+              const float4 value = ldg_read_float4(in_ptr + ptr[0] + c_base);
+              const float w = static_cast<float>(weight[0]);
+              acc.x += value.x * w; acc.y += value.y * w; acc.z += value.z * w; acc.w += value.w * w;
+            }
+            if (ptr[1] >= 0)
+            {
+              const float4 value = ldg_read_float4(in_ptr + ptr[1] + c_base);
+              const float w = static_cast<float>(weight[1]);
+              acc.x += value.x * w; acc.y += value.y * w; acc.z += value.z * w; acc.w += value.w * w;
+            }
+            if (ptr[2] >= 0)
+            {
+              const float4 value = ldg_read_float4(in_ptr + ptr[2] + c_base);
+              const float w = static_cast<float>(weight[2]);
+              acc.x += value.x * w; acc.y += value.y * w; acc.z += value.z * w; acc.w += value.w * w;
+            }
+            if (ptr[3] >= 0)
+            {
+              const float4 value = ldg_read_float4(in_ptr + ptr[3] + c_base);
+              const float w = static_cast<float>(weight[3]);
+              acc.x += value.x * w; acc.y += value.y * w; acc.z += value.z * w; acc.w += value.w * w;
+            }
+          }
+          reinterpret_cast<float4*>(out_ptr)[c_vec] = acc;
+        }
+        return;
+      }
+    }
+
+    for (int c_col = threadIdx.x; c_col < channels; c_col += blockDim.x)
+    {
+      scalar_t col = 0;
+      #pragma unroll
+      for (int sample_offset = 0; sample_offset < num_level_points; ++sample_offset)
+      {
+        const int* ptr = smem_ptr + sample_offset * 4;
+        const scalar_t* weight = smem_weight + sample_offset * 4;
+        if (ptr[0] >= 0) col += ldg_read(data_value_ptr + ptr[0] + c_col) * weight[0];
+        if (ptr[1] >= 0) col += ldg_read(data_value_ptr + ptr[1] + c_col) * weight[1];
+        if (ptr[2] >= 0) col += ldg_read(data_value_ptr + ptr[2] + c_col) * weight[2];
+        if (ptr[3] >= 0) col += ldg_read(data_value_ptr + ptr[3] + c_col) * weight[3];
+      }
+      data_col_ptr[c_col] = col;
+    }
+}
+#elif OPT == 3 // naive+float4
+template <typename scalar_t>
+__global__ void ms_deformable_im2col_gpu_kernel(const int n,
+                                                const scalar_t *data_value, 
+                                                const int64_t *data_spatial_shapes,
+                                                const int64_t *data_level_start_index, 
+                                                const scalar_t *data_sampling_loc,
+                                                const scalar_t *data_attn_weight,
+                                                const int batch_size, 
+                                                const int spatial_size, 
+                                                const int num_heads,
+                                                const int channels, 
+                                                const int num_levels,
+                                                const int num_query,
+                                                const int num_point,
+                                                scalar_t *data_col)
+{
+  if constexpr (std::is_same<scalar_t, float>::value)
+  {
+    if ((channels & 3) == 0)
+    {
+      const int vec_channels = channels >> 2;
+      CUDA_KERNEL_LOOP(index, n)
+      {
+        int _temp = index;
+        const int c_vec = _temp % vec_channels;
+        _temp /= vec_channels;
+        const int sampling_index = _temp;
+        const int m_col = _temp % num_heads;
+        _temp /= num_heads;
+        const int q_col = _temp % num_query;
+        _temp /= num_query;
+        const int b_col = _temp;
+
+        float4 *data_col_ptr = reinterpret_cast<float4*>(data_col) + index;
+        int data_weight_ptr = sampling_index * num_levels * num_point;
+        int data_loc_w_ptr = data_weight_ptr << 1;
+        const int qid_stride = num_heads * channels;
+        const int data_value_ptr_init_offset = b_col * spatial_size * qid_stride;
+        const float *data_value_ptr_init =
+            reinterpret_cast<const float*>(data_value) + data_value_ptr_init_offset;
+        const int c_base = c_vec << 2;
+        float4 col = make_float4(0.f, 0.f, 0.f, 0.f);
+
+        for (int l_col = 0; l_col < num_levels; ++l_col)
+        {
+          const int level_start_id = data_level_start_index[l_col];
+          const int spatial_h_ptr = l_col << 1;
+          const int spatial_h = data_spatial_shapes[spatial_h_ptr];
+          const int spatial_w = data_spatial_shapes[spatial_h_ptr + 1];
+          const float *data_value_ptr =
+              data_value_ptr_init + level_start_id * qid_stride;
+          for (int p_col = 0; p_col < num_point; ++p_col)
+          {
+            const float loc_w = data_sampling_loc[data_loc_w_ptr];
+            const float loc_h = data_sampling_loc[data_loc_w_ptr + 1];
+            const float weight = data_attn_weight[data_weight_ptr];
+
+            const float h_im = loc_h * spatial_h - 0.5f;
+            const float w_im = loc_w * spatial_w - 0.5f;
+
+            if (h_im > -1 && w_im > -1 && h_im < spatial_h && w_im < spatial_w)
+            {
+              const float4 val = ms_deform_attn_im2col_bilinear_float4(
+                  data_value_ptr,
+                  spatial_h,
+                  spatial_w,
+                  num_heads,
+                  channels,
+                  h_im,
+                  w_im,
+                  m_col,
+                  c_base);
+              col.x += val.x * weight;
+              col.y += val.y * weight;
+              col.z += val.z * weight;
+              col.w += val.w * weight;
+            }
+
+            data_weight_ptr += 1;
+            data_loc_w_ptr += 2;
+          }
+        }
+        *data_col_ptr = col;
+      }
+      return;
+    }
+  }
+
+  CUDA_KERNEL_LOOP(index, n)
+  {
+    int _temp = index;
+    const int c_col = _temp % channels;
+    _temp /= channels;
+    const int sampling_index = _temp; 
+    const int m_col = _temp % num_heads;
+    _temp /= num_heads;
+    const int q_col = _temp % num_query;
+    _temp /= num_query;
+    const int b_col = _temp;
+
+    scalar_t *data_col_ptr = data_col + index;
+    int data_weight_ptr = sampling_index * num_levels * num_point;
+    int data_loc_w_ptr = data_weight_ptr << 1;
+    const int qid_stride = num_heads * channels;
+    const int data_value_ptr_init_offset = b_col * spatial_size * qid_stride;
+    scalar_t col = 0;
+
+    for (int l_col = 0; l_col < num_levels; ++l_col)
+    {
+      const int level_start_id = data_level_start_index[l_col];
+      const int spatial_h_ptr = l_col << 1;
+      const int spatial_h = data_spatial_shapes[spatial_h_ptr];
+      const int spatial_w = data_spatial_shapes[spatial_h_ptr + 1];
+      const scalar_t *data_value_ptr =
+          data_value + (data_value_ptr_init_offset + level_start_id * qid_stride);
+      for (int p_col = 0; p_col < num_point; ++p_col)
+      {
+        const scalar_t loc_w = data_sampling_loc[data_loc_w_ptr];
+        const scalar_t loc_h = data_sampling_loc[data_loc_w_ptr + 1];
+        const scalar_t weight = data_attn_weight[data_weight_ptr];
+
+        const scalar_t h_im = loc_h * spatial_h - 0.5;
+        const scalar_t w_im = loc_w * spatial_w - 0.5;
+
+        if (h_im > -1 && w_im > -1 && h_im < spatial_h && w_im < spatial_w)
+        {
+          col += ms_deform_attn_im2col_bilinear(
+              data_value_ptr,
+              spatial_h,
+              spatial_w,
+              num_heads,
+              channels,
+              h_im,
+              w_im,
+              m_col,
+              c_col) * weight;
+        }
+
+        data_weight_ptr += 1;
+        data_loc_w_ptr += 2;
+      }
+    }
+    *data_col_ptr = col;
+  }
+}
+#elif OPT == 4
 #endif
 template <typename scalar_t, unsigned int blockSize>
 __global__ void ms_deformable_col2im_gpu_kernel_shm_blocksize_aware_reduce_v1(const int n,
@@ -1065,12 +1464,24 @@ void ms_deformable_im2col_cuda(cudaStream_t stream,
                               const int num_point,
                               scalar_t* data_col)
 {
-  const int num_kernels = batch_size * num_query * num_heads * channels;       // 1,2,2,2=8
-  const int num_actual_kernels = batch_size * num_query * num_heads;
+  int num_kernels = batch_size * num_query * num_heads * channels;       // 1,2,2,2=8
   const int rounded_channels = ((channels + 31) / 32) * 32;
   const int num_threads = std::min(CUDA_NUM_THREADS, std::max(32, rounded_channels));
   const size_t shared_memory_bytes =
       static_cast<size_t>(num_levels) * num_point * (4 * sizeof(int) + 4 * sizeof(scalar_t));
+#if OPT == 3
+  if constexpr (std::is_same<scalar_t, float>::value)
+  {
+    if ((channels & 3) == 0)
+    {
+      num_kernels /= 4;
+    }
+  }
+#endif
+  int num_actual_kernels = batch_size * num_query * num_heads;
+#if OPT == 0 || OPT == 3
+  num_actual_kernels = GET_BLOCKS(num_kernels, num_threads);
+#endif
   ms_deformable_im2col_gpu_kernel<scalar_t>
       <<<num_actual_kernels, num_threads,
           shared_memory_bytes, stream>>>(
@@ -1082,7 +1493,6 @@ void ms_deformable_im2col_cuda(cudaStream_t stream,
   {
     printf("error in ms_deformable_im2col_cuda: %s\n", cudaGetErrorString(err));
   }
-
 }
 
 template <typename scalar_t>

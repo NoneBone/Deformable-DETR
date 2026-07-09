@@ -23,7 +23,8 @@ Time	Total Time	Instances	Avg	Med	Min	Max	StdDev	Name
 内核行为：
 - 随机采样点导致线程不规则的访存，从 GMEM 读取可能存在未合并问题；
 - 单线程完成双线性插值及最后的 attention 计算，很容易计算密集；
-- 内核计算复杂度：，层数 * 采样点数
+- 内核计算复杂度：层数 * 采样点数
+
 ## ncu 问题
 
 full 采集无法进行，能否只采集关键指标？待尝试。
@@ -77,7 +78,7 @@ All forward tests PASSED.
 [BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              24199.16 us   268.22 GB/s
 ```
 
-## smem 
+## opt1.smem 
 
 一个 block 对应一个 (b, q, m)。block 内线程沿 channel 维展开。
 然后所有 channel 线程复用这份 shared metadata 去读 data_value 并累加。
@@ -108,12 +109,60 @@ All forward tests PASSED.
 [BENCH] FP32 B=256 Q=300  H=8  C=32 L=4 P=4 step=256 (batched-256)                  5556.07 us   292.05 GB/s
 [BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              22221.82 us   292.09 GB/s
 ```
-## opt1
+
+## opt2.float4
+
+float4 等向量化加载，__ldg 加载，反而变慢了，这符合计算密集型 op 的特性。
+但鉴于没什么优化，待采用 NCU 定位问题。
 
 ```sh
+(cp312) l8w@l8w:/media/l8w/Linux118/PROJECTS/31-vision/01_Deformable-DETR/models/ops$ python benchmark.py
+=== MSDeformAttn forward tests ===
+
+[PASS] FP64 B=1  Q=2    H=2  C=2  L=2 P=2 step=1  (sanity)                      [MAX] abs_err 8.674e-19 rel_err 2.396e-16
+[PASS] FP32 B=2  Q=32   H=4  C=8  L=3 P=4 step=2  (multi-level)                 [MAX] abs_err 1.863e-09 rel_err 4.372e-07
+[PASS] FP32 B=2  Q=128  H=8  C=16 L=4 P=4 step=2  (detector-like)               [MAX] abs_err 2.794e-09 rel_err 5.488e-07
+
+All forward tests PASSED.
+
+=== MSDeformAttn forward benchmarks (warmup=10, iters=100) ===
+[BENCH] FP32 B=1  Q=300  H=8  C=32 L=4 P=4 step=1  (deformable-detr)                  16.80 us   377.31 GB/s
+[BENCH] FP32 B=2  Q=300  H=8  C=32 L=4 P=4 step=2  (batched-2)                        29.89 us   424.13 GB/s
+[BENCH] FP32 B=4  Q=300  H=8  C=32 L=4 P=4 step=4  (batched-4)                        54.83 us   462.40 GB/s
+[BENCH] FP32 B=16 Q=300  H=8  C=32 L=4 P=4 step=16 (batched-16)                      349.42 us   290.25 GB/s
+[BENCH] FP32 B=64 Q=300  H=8  C=32 L=4 P=4 step=64 (batched-64)                     1424.07 us   284.86 GB/s
+[BENCH] FP32 B=256 Q=300  H=8  C=32 L=4 P=4 step=256 (batched-256)                  5633.47 us   288.04 GB/s
+[BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              22544.51 us   287.91 GB/s
 
 ```
-## opt2
+## opt3.naive+float4
+保持 opt0 的线程组织与循环结构，仅在 `float32 + channels % 4 == 0` 时改为
+“1 线程 = 1 float4”，用于隔离验证向量化本身的收益。
+
+```sh
+=== MSDeformAttn forward tests ===
+
+[PASS] FP64 B=1  Q=2    H=2  C=2  L=2 P=2 step=1  (sanity)                      [MAX] abs_err 8.674e-19 rel_err 1.978e-16
+[PASS] FP32 B=2  Q=32   H=4  C=8  L=3 P=4 step=2  (multi-level)                 [MAX] abs_err 4.657e-10 rel_err 1.130e-07
+[PASS] FP32 B=2  Q=128  H=8  C=16 L=4 P=4 step=2  (detector-like)               [MAX] abs_err 4.657e-10 rel_err 1.130e-07
+
+All forward tests PASSED.
+
+=== MSDeformAttn forward benchmarks (warmup=10, iters=100) ===
+[BENCH] FP32 B=1  Q=300  H=8  C=32 L=4 P=4 step=1  (deformable-detr)                  15.24 us   415.90 GB/s
+[BENCH] FP32 B=2  Q=300  H=8  C=32 L=4 P=4 step=2  (batched-2)                        31.36 us   404.31 GB/s
+[BENCH] FP32 B=4  Q=300  H=8  C=32 L=4 P=4 step=4  (batched-4)                        51.84 us   489.12 GB/s
+[BENCH] FP32 B=16 Q=300  H=8  C=32 L=4 P=4 step=16 (batched-16)                      313.81 us   323.18 GB/s
+[BENCH] FP32 B=64 Q=300  H=8  C=32 L=4 P=4 step=64 (batched-64)                     1265.29 us   320.61 GB/s
+[BENCH] FP32 B=256 Q=300  H=8  C=32 L=4 P=4 step=256 (batched-256)                  5002.58 us   324.37 GB/s
+[BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              19954.29 us   325.28 GB/s
+```
+
+## opt3.doubleBuffer
+跳过 opt1 的方法，直接实现 float4 后，再考虑 doublebuffer 实现。
+
+## opt4.bf16实现，TC 支持
+
 
 ```sh
 
