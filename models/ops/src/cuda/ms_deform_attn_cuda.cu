@@ -55,10 +55,10 @@ at::Tensor ms_deform_attn_cuda_forward(
 
     const int batch_n = im2col_step_;
     auto output_n = output.view({batch/im2col_step_, batch_n, num_query, num_heads, channels});
-    auto per_value_size = spatial_size * num_heads * channels;
-    auto per_sample_loc_size = num_query * num_heads * num_levels * num_point * 2;
-    auto per_attn_weight_size = num_query * num_heads * num_levels * num_point;
-    for (int n = 0; n < batch/im2col_step_; ++n)
+    auto per_value_size = spatial_size * num_heads * channels;// 30 * 2 * 2 = 120  用于处理批次偏移用
+    auto per_sample_loc_size = num_query * num_heads * num_levels * num_point * 2;// 2 ^ 4 = 16
+    auto per_attn_weight_size = num_query * num_heads * num_levels * num_point;   // 2 ^ 4 = 16 
+    for (int n = 0; n < batch/im2col_step_; ++n)// 将批尺寸按 step 来循环处理 ？
     {
         auto columns = output_n.select(0, n);
         AT_DISPATCH_FLOATING_TYPES(value.scalar_type(), "ms_deform_attn_forward_cuda", ([&] {

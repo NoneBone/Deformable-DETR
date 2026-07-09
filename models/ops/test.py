@@ -18,10 +18,10 @@ from torch.autograd import gradcheck
 from functions.ms_deform_attn_func import MSDeformAttnFunction, ms_deform_attn_core_pytorch
 
 
-N, M, D = 1, 2, 2
-Lq, L, P = 2, 2, 2
+N, M, D = 1, 2, 2      # batch_size=1, 注意力头数=2, 每个头的特征维度=2
+Lq, L, P = 2, 2, 2     # 查询点数=2, 特征层数=2, 每层采样点数=2
 shapes = torch.as_tensor([(6, 4), (3, 2)], dtype=torch.long).cuda()
-level_start_index = torch.cat((shapes.new_zeros((1, )), shapes.prod(1).cumsum(0)[:-1]))
+level_start_index = torch.cat((shapes.new_zeros((1, )), shapes.prod(1).cumsum(0)[:-1])) # 0, 6*4
 S = sum([(H*W).item() for H, W in shapes])
 
 

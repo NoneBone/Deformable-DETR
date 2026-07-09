@@ -29,13 +29,22 @@ inline int GET_BLOCKS(const int N, const int num_threads)
   return (N + num_threads - 1) / num_threads;
 }
 
-
+/*
+采样: https://docs.pytorch.org/docs/2.11/generated/torch.nn.functional.grid_sample.html
+双线性加权公式: 
+output[n,c,h,w] =
+  I(y0,x0) * (1-dx)*(1-dy)
++ I(y0,x1) *   dx  *(1-dy)
++ I(y1,x0) * (1-dx)*  dy
++ I(y1,x1) *   dx  *  dy
+单个线程读取 4 个采样点, 双线性插值的工业级 cuda kernel 实现如何？
+*/
 template <typename scalar_t>
 __device__ scalar_t ms_deform_attn_im2col_bilinear(const scalar_t* &bottom_data, 
                                                    const int &height, const int &width, const int &nheads, const int &channels,
                                                    const scalar_t &h, const scalar_t &w, const int &m, const int &c)
 {
-  const int h_low = floor(h);
+  const int h_low = floor(h);// 向下取整
   const int w_low = floor(w);
   const int h_high = h_low + 1;
   const int w_high = w_low + 1;
@@ -233,7 +242,8 @@ __device__ void ms_deform_attn_col2im_bilinear_gm(const scalar_t* &bottom_data,
   atomicAdd(grad_sampling_loc + 1, height * grad_h_weight * top_grad_value);
 }
 
-
+#define OPT 1 // 
+#if OPT == 0
 template <typename scalar_t>
 __global__ void ms_deformable_im2col_gpu_kernel(const int n,
                                                 const scalar_t *data_value, 
@@ -250,7 +260,7 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n,
                                                 const int num_point,
                                                 scalar_t *data_col)
 {
-  CUDA_KERNEL_LOOP(index, n)
+  CUDA_KERNEL_LOOP(index, n) // idx = 0 ～ 7;
   {
     int _temp = index;
     const int c_col = _temp % channels;
@@ -269,14 +279,14 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n,
     const int data_value_ptr_init_offset = b_col * spatial_size * qid_stride;
     scalar_t col = 0;
     
-    for (int l_col=0; l_col < num_levels; ++l_col)
+    for (int l_col=0; l_col < num_levels; ++l_col)// 0; 1
     {
       const int level_start_id = data_level_start_index[l_col];
       const int spatial_h_ptr = l_col << 1;
       const int spatial_h = data_spatial_shapes[spatial_h_ptr];
       const int spatial_w = data_spatial_shapes[spatial_h_ptr + 1];
       const scalar_t *data_value_ptr = data_value + (data_value_ptr_init_offset + level_start_id * qid_stride);
-      for (int p_col=0; p_col < num_point; ++p_col)
+      for (int p_col=0; p_col < num_point; ++p_col)// 0; 1
       {
         const scalar_t loc_w = data_sampling_loc[data_loc_w_ptr];
         const scalar_t loc_h = data_sampling_loc[data_loc_w_ptr + 1];
@@ -297,7 +307,126 @@ __global__ void ms_deformable_im2col_gpu_kernel(const int n,
     *data_col_ptr = col;
   }
 }
+#else if OPT == 1
+template <typename scalar_t>
+__global__ void ms_deformable_im2col_gpu_kernel(
+    const int n,
+    const scalar_t* __restrict__ data_value,
+    const int64_t* __restrict__ data_spatial_shapes,
+    const int64_t* __restrict__ data_level_start_index,
+    const scalar_t* __restrict__ data_sampling_loc,
+    const scalar_t* __restrict__ data_attn_weight,
+    const int batch_size,
+    const int spatial_size,
+    const int num_heads,
+    const int channels,
+    const int num_levels,
+    const int num_query,
+    const int num_point,
+    scalar_t* __restrict__ data_col)
+{
+    extern __shared__ unsigned char smem_raw[];
+    const int sampling_index = blockIdx.x;
+    const int total_sampling = n / channels;
+    if (sampling_index >= total_sampling) return;
 
+    const int num_level_points = num_levels * num_point;
+    int* smem_ptr = reinterpret_cast<int*>(smem_raw);
+    scalar_t* smem_weight = reinterpret_cast<scalar_t*>(smem_ptr + num_level_points * 4);
+
+    const int m_col = sampling_index % num_heads;
+    const int b_col = (sampling_index / num_heads) / num_query;
+    const int qid_stride = num_heads * channels;
+    const int w_stride = qid_stride;
+    const int data_value_ptr_init_offset = b_col * spatial_size * qid_stride;
+    const scalar_t* data_value_ptr = data_value + data_value_ptr_init_offset;
+    const int sampling_offset = sampling_index * num_level_points;
+
+    for (int sample_offset = threadIdx.x; sample_offset < num_level_points; sample_offset += blockDim.x)
+    {
+      const int l_col = sample_offset / num_point;
+      const int spatial_h_ptr = l_col << 1;
+      const int spatial_h = static_cast<int>(data_spatial_shapes[spatial_h_ptr]);
+      const int spatial_w = static_cast<int>(data_spatial_shapes[spatial_h_ptr + 1]);
+      const int level_start_id = static_cast<int>(data_level_start_index[l_col]);
+      const int data_weight_ptr = sampling_offset + sample_offset;
+      const int data_loc_w_ptr = data_weight_ptr << 1;
+      const scalar_t loc_w = data_sampling_loc[data_loc_w_ptr];
+      const scalar_t loc_h = data_sampling_loc[data_loc_w_ptr + 1];
+      const scalar_t attn_weight = data_attn_weight[data_weight_ptr];
+
+      int* ptr = smem_ptr + sample_offset * 4;
+      scalar_t* weight = smem_weight + sample_offset * 4;
+      ptr[0] = -1; ptr[1] = -1; ptr[2] = -1; ptr[3] = -1;
+      weight[0] = 0; weight[1] = 0; weight[2] = 0; weight[3] = 0;
+
+      const scalar_t h_im = loc_h * spatial_h - static_cast<scalar_t>(0.5);
+      const scalar_t w_im = loc_w * spatial_w - static_cast<scalar_t>(0.5);
+
+      if (h_im > -1 && w_im > -1 && h_im < spatial_h && w_im < spatial_w)
+      {
+        const int h_low = floor(h_im);
+        const int w_low = floor(w_im);
+        const int h_high = h_low + 1;
+        const int w_high = w_low + 1;
+
+        const scalar_t lh = h_im - h_low;
+        const scalar_t lw = w_im - w_low;
+        const scalar_t hh = 1 - lh;
+        const scalar_t hw = 1 - lw;
+
+        const int h_stride = spatial_w * w_stride;
+        const int base_ptr = level_start_id * qid_stride + m_col * channels;
+        const int h_low_ptr_offset = h_low * h_stride;
+        const int h_high_ptr_offset = h_low_ptr_offset + h_stride;
+        const int w_low_ptr_offset = w_low * w_stride;
+        const int w_high_ptr_offset = w_low_ptr_offset + w_stride;
+
+        if (h_low >= 0 && w_low >= 0)
+        {
+          ptr[0] = base_ptr + h_low_ptr_offset + w_low_ptr_offset;
+          weight[0] = attn_weight * hh * hw;
+        }
+        if (h_low >= 0 && w_high <= spatial_w - 1)
+        {
+          ptr[1] = base_ptr + h_low_ptr_offset + w_high_ptr_offset;
+          weight[1] = attn_weight * hh * lw;
+        }
+        if (h_high <= spatial_h - 1 && w_low >= 0)
+        {
+          ptr[2] = base_ptr + h_high_ptr_offset + w_low_ptr_offset;
+          weight[2] = attn_weight * lh * hw;
+        }
+        if (h_high <= spatial_h - 1 && w_high <= spatial_w - 1)
+        {
+          ptr[3] = base_ptr + h_high_ptr_offset + w_high_ptr_offset;
+          weight[3] = attn_weight * lh * lw;
+        }
+      }
+    }
+    __syncthreads();
+
+    scalar_t* data_col_ptr = data_col + sampling_index * channels;
+    for (int c_col = threadIdx.x; c_col < channels; c_col += blockDim.x)
+    {
+      scalar_t col = 0;
+      #pragma unroll
+      for (int sample_offset = 0; sample_offset < num_level_points; ++sample_offset)
+      {
+        const int* ptr = smem_ptr + sample_offset * 4;
+        const scalar_t* weight = smem_weight + sample_offset * 4;
+        if (ptr[0] >= 0) col += data_value_ptr[ptr[0] + c_col] * weight[0];
+        if (ptr[1] >= 0) col += data_value_ptr[ptr[1] + c_col] * weight[1];
+        if (ptr[2] >= 0) col += data_value_ptr[ptr[2] + c_col] * weight[2];
+        if (ptr[3] >= 0) col += data_value_ptr[ptr[3] + c_col] * weight[3];
+      }
+      data_col_ptr[c_col] = col;
+    }
+}
+#else if OPT == 2
+#else if OPT == 3
+#else if OPT == 4
+#endif
 template <typename scalar_t, unsigned int blockSize>
 __global__ void ms_deformable_col2im_gpu_kernel_shm_blocksize_aware_reduce_v1(const int n,
                                                 const scalar_t *grad_col,
@@ -936,12 +1065,15 @@ void ms_deformable_im2col_cuda(cudaStream_t stream,
                               const int num_point,
                               scalar_t* data_col)
 {
-  const int num_kernels = batch_size * num_query * num_heads * channels;
-  const int num_actual_kernels = batch_size * num_query * num_heads * channels;
-  const int num_threads = CUDA_NUM_THREADS;
+  const int num_kernels = batch_size * num_query * num_heads * channels;       // 1,2,2,2=8
+  const int num_actual_kernels = batch_size * num_query * num_heads;
+  const int rounded_channels = ((channels + 31) / 32) * 32;
+  const int num_threads = std::min(CUDA_NUM_THREADS, std::max(32, rounded_channels));
+  const size_t shared_memory_bytes =
+      static_cast<size_t>(num_levels) * num_point * (4 * sizeof(int) + 4 * sizeof(scalar_t));
   ms_deformable_im2col_gpu_kernel<scalar_t>
-      <<<GET_BLOCKS(num_actual_kernels, num_threads), num_threads,
-          0, stream>>>(
+      <<<num_actual_kernels, num_threads,
+          shared_memory_bytes, stream>>>(
       num_kernels, data_value, data_spatial_shapes, data_level_start_index, data_sampling_loc, data_attn_weight, 
       batch_size, spatial_size, num_heads, channels, num_levels, num_query, num_point, data_col);
   

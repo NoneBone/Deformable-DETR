@@ -53,9 +53,44 @@ def ms_deform_attn_core_pytorch(value, value_spatial_shapes, sampling_locations,
         sampling_grid_l_ = sampling_grids[:, :, :, lid_].transpose(1, 2).flatten(0, 1)
         # N_*M_, D_, Lq_, P_
         sampling_value_l_ = F.grid_sample(value_l_, sampling_grid_l_,
-                                          mode='bilinear', padding_mode='zeros', align_corners=False)
+                                          mode='bilinear', padding_mode='zeros', align_corners=False)# 从 HW 图像变为 查询的采样点 Lq * p
         sampling_value_list.append(sampling_value_l_)
     # (N_, Lq_, M_, L_, P_) -> (N_, M_, Lq_, L_, P_) -> (N_, M_, 1, Lq_, L_*P_)
     attention_weights = attention_weights.transpose(1, 2).reshape(N_*M_, 1, Lq_, L_*P_)
+    # list of (N_*M_, D_, Lq_, P_) -> (N_*M_, D_, Lq_, L_, P_) -> 
+    # (N_*M_, D_, Lq_, L_*P_) * (N_*M_, 1, Lq_, L_*P_) -> (N_*M_, D_, Lq_, L_*P_) ->
+    # (N_*M_, D_, Lq_) -> (N_, M_*D_, Lq_) -> (N_, Lq_, M_*D_)
     output = (torch.stack(sampling_value_list, dim=-2).flatten(-2) * attention_weights).sum(-1).view(N_, M_*D_, Lq_)
     return output.transpose(1, 2).contiguous()
+
+'''
+算法名称
+Multi-Scale Deformable Attention(多尺度可变形注意力)
+核心创新点
+- 稀疏采样：每个查询只关注少量关键位置，而非全局注意力
+- 多尺度融合：从不同分辨率的特征图中采样信息
+- 动态偏移：采样位置由网络预测，可适应不同形状和尺度目标
+
+论文: Deformable DETR: Deformable Transformers for End-to-End Object Detection
+
+N, M, D = 1, 2, 2      # batch_size=1, 注意力头数=2, 每个头的特征维度=2
+Lq, L, P = 2, 2, 2     # 查询点数=2, 特征层数=2, 每层采样点数=2
+
+shapes = torch.as_tensor([(6, 4), (3, 2)], dtype=torch.long).cuda()
+value: 1,30,2,2
+sampling_locations: 1,2,2,2,2,2
+attention_weights: 1,2,2,2,2 -> 2,1,2,4
+output: 1,2,4
+
+输入: 多尺度特征图 [Level1(H1xW1), Level2(H2xW2)]
+        ↓
+为每个查询生成:
+  ├─ 采样偏移 (Lq x M x L x P x 2)
+  └─ 注意力权重 (Lq x M x L x P)
+        ↓
+双线性插值采样 → 获得采样值 (NxMxDxLqxLxP)
+        ↓
+注意力权重加权 → 加权求和
+        ↓
+输出: (N, Lq, MxD)
+'''
