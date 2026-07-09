@@ -27,16 +27,23 @@ mkdir -p "${NSYS_DIR}" || { echo "X Failed to create the directory"; exit 1; }
 
 ```sh
 # para.
-op=demo_e2e
-skip=10
-launch=10
+op=0
+# 修改 21 行
+sh ./make.sh
+
+skip=0
+launch=23
 # cmd
-NCU_DIR=./A-LLM-PERF/$op/NCU
+NCU_DIR=../../docs/ncu/
 mkdir -p "${NCU_DIR}" || { echo "X Failed to create the directory"; exit 1; }
 
-export TORCH_CUDA_ARCH_LIST="8.9"
+sudo /usr/local/cuda-12.8/bin/ncu --set full -o  \
+$NCU_DIR/MSDA_$op.ncu-rep \
+-k regex:"attn|defor" \
+--launch-skip "${skip}" --launch-count "${launch}" \
+-f \
+/home/l8w/miniconda3/envs/cp312/bin/python benchmark.py
 
-sudo /usr/local/cuda-12.8/bin/ncu  --set full --launch-skip "${skip}" --launch-count "${launch}" -k regex:"attention" --target-processes all -f -o $NCU_DIR/attn_$op.ncu-rep /home/l8w/miniconda3/envs/cp310/bin/python demo_e2e.py
 
 # |rms|Kernel|gemv2T
 num=9

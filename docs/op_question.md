@@ -91,6 +91,11 @@ All forward tests PASSED.
   - 全局内存读写模式优化
   - __restrict__+ 只读缓存：让编译器推断采用常量或纹理 mem
 
+
+问题：
+- SMEM 的store 存在19200/24000 的 BC，
+- 额外引入了一定的 WD；
+
 ```sh
 === MSDeformAttn forward tests ===
 
@@ -110,13 +115,14 @@ All forward tests PASSED.
 [BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              22221.82 us   292.09 GB/s
 ```
 
-## opt2.float4
+## opt2.smem double buffer
 
-float4 等向量化加载，__ldg 加载，反而变慢了，这符合计算密集型 op 的特性。
-但鉴于没什么优化，待采用 NCU 定位问题。
+基于 opt1，无效的进一步优化:
+- float4 向量化加载，__ldg 加载，反而变慢了，这符合计算密集型 op 的特性。
+- doublebuffer 向量化加载。
 
 ```sh
-(cp312) l8w@l8w:/media/l8w/Linux118/PROJECTS/31-vision/01_Deformable-DETR/models/ops$ python benchmark.py
+# float4
 === MSDeformAttn forward tests ===
 
 [PASS] FP64 B=1  Q=2    H=2  C=2  L=2 P=2 step=1  (sanity)                      [MAX] abs_err 8.674e-19 rel_err 2.396e-16
@@ -134,34 +140,50 @@ All forward tests PASSED.
 [BENCH] FP32 B=256 Q=300  H=8  C=32 L=4 P=4 step=256 (batched-256)                  5633.47 us   288.04 GB/s
 [BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              22544.51 us   287.91 GB/s
 
-```
-## opt3.naive+float4
-保持 opt0 的线程组织与循环结构，仅在 `float32 + channels % 4 == 0` 时改为
-“1 线程 = 1 float4”，用于隔离验证向量化本身的收益。
-
-```sh
+# doubleBuffer
 === MSDeformAttn forward tests ===
 
-[PASS] FP64 B=1  Q=2    H=2  C=2  L=2 P=2 step=1  (sanity)                      [MAX] abs_err 8.674e-19 rel_err 1.978e-16
-[PASS] FP32 B=2  Q=32   H=4  C=8  L=3 P=4 step=2  (multi-level)                 [MAX] abs_err 4.657e-10 rel_err 1.130e-07
-[PASS] FP32 B=2  Q=128  H=8  C=16 L=4 P=4 step=2  (detector-like)               [MAX] abs_err 4.657e-10 rel_err 1.130e-07
+[PASS] FP64 B=1  Q=2    H=2  C=2  L=2 P=2 step=1  (sanity)                      [MAX] abs_err 8.674e-19 rel_err 2.396e-16
+[PASS] FP32 B=2  Q=32   H=4  C=8  L=3 P=4 step=2  (multi-level)                 [MAX] abs_err 1.863e-09 rel_err 4.372e-07
+[PASS] FP32 B=2  Q=128  H=8  C=16 L=4 P=4 step=2  (detector-like)               [MAX] abs_err 2.794e-09 rel_err 5.488e-07
 
 All forward tests PASSED.
 
 === MSDeformAttn forward benchmarks (warmup=10, iters=100) ===
-[BENCH] FP32 B=1  Q=300  H=8  C=32 L=4 P=4 step=1  (deformable-detr)                  15.24 us   415.90 GB/s
-[BENCH] FP32 B=2  Q=300  H=8  C=32 L=4 P=4 step=2  (batched-2)                        31.36 us   404.31 GB/s
-[BENCH] FP32 B=4  Q=300  H=8  C=32 L=4 P=4 step=4  (batched-4)                        51.84 us   489.12 GB/s
-[BENCH] FP32 B=16 Q=300  H=8  C=32 L=4 P=4 step=16 (batched-16)                      313.81 us   323.18 GB/s
-[BENCH] FP32 B=64 Q=300  H=8  C=32 L=4 P=4 step=64 (batched-64)                     1265.29 us   320.61 GB/s
-[BENCH] FP32 B=256 Q=300  H=8  C=32 L=4 P=4 step=256 (batched-256)                  5002.58 us   324.37 GB/s
-[BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              19954.29 us   325.28 GB/s
+[BENCH] FP32 B=1  Q=300  H=8  C=32 L=4 P=4 step=1  (deformable-detr)                  17.04 us   371.93 GB/s
+[BENCH] FP32 B=2  Q=300  H=8  C=32 L=4 P=4 step=2  (batched-2)                        29.96 us   423.11 GB/s
+[BENCH] FP32 B=4  Q=300  H=8  C=32 L=4 P=4 step=4  (batched-4)                        55.00 us   460.95 GB/s
+[BENCH] FP32 B=16 Q=300  H=8  C=32 L=4 P=4 step=16 (batched-16)                      351.13 us   288.83 GB/s
+[BENCH] FP32 B=64 Q=300  H=8  C=32 L=4 P=4 step=64 (batched-64)                     1428.01 us   284.08 GB/s
+[BENCH] FP32 B=256 Q=300  H=8  C=32 L=4 P=4 step=256 (batched-256)                  5664.16 us   286.48 GB/s
+[BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              22695.42 us   285.99 GB/s
 ```
 
-## opt3.doubleBuffer
-跳过 opt1 的方法，直接实现 float4 后，再考虑 doublebuffer 实现。
+## opt4.v3+reg_prefetch
+在 opt3 的基础上，只做 one-step 寄存器级预取：
+当前 sample 计算时，提前把下一个 sample 的 `loc/weight/shape/level_start`
+读到寄存器，验证是否存在可被软件流水隐藏的 latency。
 
-## opt4.bf16实现，TC 支持
+```sh
+=== MSDeformAttn forward tests ===
+
+[PASS] FP64 B=1  Q=2    H=2  C=2  L=2 P=2 step=1  (sanity)                      [MAX] abs_err 8.674e-19 rel_err 1.831e-16
+[PASS] FP32 B=2  Q=32   H=4  C=8  L=3 P=4 step=2  (multi-level)                 [MAX] abs_err 1.397e-09 rel_err 2.593e-07
+[PASS] FP32 B=2  Q=128  H=8  C=16 L=4 P=4 step=2  (detector-like)               [MAX] abs_err 1.397e-09 rel_err 3.321e-07
+
+All forward tests PASSED.
+
+=== MSDeformAttn forward benchmarks (warmup=10, iters=100) ===
+[BENCH] FP32 B=1  Q=300  H=8  C=32 L=4 P=4 step=1  (deformable-detr)                  15.33 us   413.54 GB/s
+[BENCH] FP32 B=2  Q=300  H=8  C=32 L=4 P=4 step=2  (batched-2)                        31.54 us   401.99 GB/s
+[BENCH] FP32 B=4  Q=300  H=8  C=32 L=4 P=4 step=4  (batched-4)                        51.47 us   492.57 GB/s
+[BENCH] FP32 B=16 Q=300  H=8  C=32 L=4 P=4 step=16 (batched-16)                      313.58 us   323.41 GB/s
+[BENCH] FP32 B=64 Q=300  H=8  C=32 L=4 P=4 step=64 (batched-64)                     1263.61 us   321.04 GB/s
+[BENCH] FP32 B=256 Q=300  H=8  C=32 L=4 P=4 step=256 (batched-256)                  4993.21 us   324.98 GB/s
+[BENCH] FP32 B=1024 Q=300  H=8  C=32 L=4 P=4 step=1024 (batched-1024)              19906.06 us   326.07 GB/s
+```
+
+## opt5.bf16实现，TC 支持
 
 
 ```sh
