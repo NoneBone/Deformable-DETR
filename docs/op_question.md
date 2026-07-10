@@ -212,3 +212,22 @@ All forward tests PASSED.
 ```sh
 
 ```
+# 集成测试
+
+## 算法架构
+
+- transformer：编解码，（linear+layerNorm）*2
+
+```
+# opt0
+Time	Total Time	Instances	Avg	Med	Min	Max	StdDev	Name
+10.7%	546.406 ms	600	910.677 μs	673.095 μs	25.632 μs	2.798 ms	927.264 μs	void ms_deformable_im2col_gpu_kernel<float>(int, const T1 *, const long *, const long *, const T1 *, const T1 *, int, int, int, int, int, int, int, T1 *)
+# opt1 1.37x
+Time	Total Time	Instances	Avg	Med	Min	Max	StdDev	Name
+8.0%	397.700 ms	600	662.833 μs	490.228 μs	20.992 μs	2.038 ms	671.912 μs	void ms_deformable_im2col_gpu_kernel<float>(int, const T1 *, const long *, const long *, const T1 *, const T1 *, int, int, int, int, int, int, int, T1 *)
+# opt3 1.90x
+Time	Total Time	Instances	Avg	Med	Min	Max	StdDev	Name
+5.9%	287.526 ms	600	479.209 μs	349.420 μs	19.391 μs	1.486 ms	481.262 μs	void ms_deformable_im2col_gpu_kernel<float>(int, const T1 *, const long *, const long *, const T1 *, const T1 *, int, int, int, int, int, int, int, T1 *)
+# 
+
+```

@@ -4,7 +4,8 @@ build/
 *.pyc
 *.nsys-rep
 *.ncu-rep
+*.pth
 
-data/coco
+data/
 .vscode/launch.json
 models/ops/dist/

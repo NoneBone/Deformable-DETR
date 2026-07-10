@@ -187,8 +187,14 @@ GPUS_PER_NODE=8 ./tools/run_dist_slurm.sh <分区名> deformable_detr 16 configs
 
 您可以获取 Deformable DETR 的配置文件和预训练模型（链接位于“主要结果”章节），然后运行以下命令在 COCO 2017 验证集上进行评估：
 
-```
+```sh
 <配置文件路径> --resume <预训练模型路径> --eval
+
+# 5
+./configs/r50_deformable_detr_plus_iterative_bbox_refinement_plus_plus_two_stage.sh \
+--eval --resume \
+./data/model/r50_deformable_detr_plus_iterative_bbox_refinement_plus_plus_two_stage-checkpoint.pth \
+>> ./data/5.log
 ```
 
 您也可以使用 `./tools/run_dist_launch.sh`或 `./tools/run_dist_slurm.sh`运行分布式评估。

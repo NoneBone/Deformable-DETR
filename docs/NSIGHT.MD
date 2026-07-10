@@ -1,5 +1,24 @@
 #### Quick NSYS
+
 ```sh
+# 输出报告
+nsys profile \
+  --trace=cuda,cublas,cudnn,nvtx \
+  --sample=none \
+  --output=./docs/nsys/detect5_1.nsys-rep \
+  --force-overwrite true \
+  --stats=true \
+  python -u main.py \
+  --output_dir exps/r50_deformable_detr_plus_iterative_bbox_refinement_plus_plus_two_stage \
+  --with_box_refine \
+  --two_stage \
+  --eval --resume \
+  ./data/model/r50_deformable_detr_plus_iterative_bbox_refinement_plus_plus_two_stage-checkpoint.pth
+```
+
+```sh
+# 更高权限
+
 # para.
 op=demo_e2e
 # cmd

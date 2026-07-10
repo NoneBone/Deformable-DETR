@@ -29,7 +29,20 @@ from torch import Tensor
 import torchvision
 if float(torchvision.__version__[:3]) < 0.5:
     import math
-    from torchvision.ops.misc import _NewEmptyTensorOp
+    try:
+        from torchvision.ops.misc import _NewEmptyTensorOp
+    except ImportError:
+        import torch
+        
+        class _NewEmptyTensorOp(torch.autograd.Function):
+            @staticmethod
+            def forward(ctx, x, new_shape):
+                return x.new_empty(new_shape)
+            
+            @staticmethod
+            def symbolic(graph, x, new_shape):
+                # ONNX 导出兼容（如果不需要可简化）
+                return graph.op("NewEmptyTensor", x, shape_i=new_shape)
     def _check_size_scale_factor(dim, size, scale_factor):
         # type: (int, Optional[List[int]], Optional[float]) -> None
         if size is None and scale_factor is None:
